@@ -1,242 +1,257 @@
-# bot.py — Yangilangan: Excel export BytesIO bilan, diagnostika komandalar, va 'ming' / 'mln' qo'llab-quvvatlash
 import logging
-import os
-import re
-from io import BytesIO
-from datetime import datetime, timedelta
-
-import pandas as pd
 from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ---------- SOZLAMALAR ----------
-# TOKENni Railway Variables -> KEY: TOKEN qilib qo'ying
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    raise RuntimeError("TOKEN muhit o'zgaruvchisi aniqlanmadi. Railway yoki lokalda TOKEN o'rnatishingiz kerak.")
+# --- Config ---
+BOT_TOKEN = "8096023469:AAGSeVbCR_OuIDwW3a4Ikzd0fu0qmgCwbOI"
+OWNER_ID = 553899950   # faqat siz uchun
 
-# Excel fayl nomlarini tekshirish (avvalgi nomlarni ham qamrab oladi)
-POSSIBLE_FILES = ["expenses.xlsx", "finance.xlsx", "data.xlsx", "hisobot.xlsx"]
-DEFAULT_FILE = "expenses.xlsx"
+DATA_FILE = "data.csv"
+LIMIT_FILE = "limit.txt"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-
-def get_file_name():
-    for f in POSSIBLE_FILES:
-        if os.path.exists(f):
-            return f
-    return DEFAULT_FILE
-
-
-def init_excel():
-    fname = get_file_name()
-    if not os.path.exists(fname):
-        df = pd.DataFrame(columns=["date", "amount", "description", "type"])
-        df.to_excel(fname, index=False)
-        logger.info("Yangi Excel fayl yaratildi: %s", fname)
+# --- Yordamchi funksiyalar ---
+def load_data():
+    if os.path.exists(DATA_FILE):
+        return pd.read_csv(DATA_FILE)
     else:
-        logger.info("Mavjud Excel fayl topildi: %s", fname)
+        return pd.DataFrame(columns=["datetime", "type", "amount", "category", "note"])
 
+def save_data(df):
+    df.to_csv(DATA_FILE, index=False)
 
-def add_record(amount: int, description: str, typ: str):
-    fname = get_file_name()
-    try:
-        df = pd.read_excel(fname)
-    except Exception:
-        df = pd.DataFrame(columns=["date", "amount", "description", "type"])
+def categorize(note):
+    note = note.lower()
+    if any(w in note for w in ["osh", "kafe", "kofe", "ovqat"]):
+        return "Ovqat"
+    if any(w in note for w in ["benzin", "avtobus", "taksi", "yoqilg'i"]):
+        return "Transport"
+    if any(w in note for w in ["internet", "telefon", "telegram"]):
+        return "Aloqa"
+    if any(w in note for w in ["oylik", "maosh", "daromad", "ish"]):
+        return "Daromad"
+    return "Boshqa"
 
+def add_record(amount, note, record_type):
+    df = load_data()
+    category = categorize(note)
     new_row = {
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "amount": int(amount),
-        "description": description,
-        "type": typ,
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "type": record_type,
+        "amount": amount,
+        "category": category,
+        "note": note
     }
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-    df.to_excel(fname, index=False)
-    logger.info("Record qo'shildi: %s -> %s (%s) fayl: %s", typ, amount, description, fname)
+    save_data(df)
 
-
-def get_summary(days=None, months=None):
-    fname = get_file_name()
-    try:
-        df = pd.read_excel(fname)
-    except Exception:
-        return None, None, None, fname
-
-    if df.empty:
-        return 0, 0, 0, fname
-
-    df["date"] = pd.to_datetime(df["date"])
-    now = datetime.now()
-
-    if days is not None:
-        start = now - timedelta(days=days)
-        df = df[df["date"] >= start]
-    if months is not None:
-        start = now - timedelta(days=months * 30)
-        df = df[df["date"] >= start]
-
-    if df.empty:
-        return 0, 0, 0, fname
-
-    # to'g'ri tip va summalash
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
-    total_income = int(df[df["type"] == "income"]["amount"].sum())
-    total_expense = int(df[df["type"] == "expense"]["amount"].sum())
-    balance = total_income - total_expense
-    return total_income, total_expense, balance, fname
-
-
-# ---------- BOT HANDLERLARI ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Handlers ---
+async def start(update: Update, context: CallbackContext):
+    if update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text(
-        "Salom! Bu bot kirim va chiqimlaringizni hisoblab boradi.\n\n"
-        "👉 Kirim uchun: +5000000 oylik tushdi  (yoki +5000 mln kabi)\n"
-        "👉 Chiqim uchun: -20000 kofe  yoki 8 minga salfetka oldim (belgisiz yozsangiz CHIQIM deb olinadi)\n\n"
+        "Salom! Bu bot faqat siz uchun ishlaydi.\n"
+        "➕ Kirim uchun: +5000000 oylik tushdi\n"
+        "➖ Chiqim uchun: -20000 kofe\n\n"
         "Buyruqlar:\n"
-        "/3days - oxirgi 3 kun\n"
+        "/today - bugungi hisob\n"
         "/7days - oxirgi 7 kun\n"
-        "/10days - oxirgi 10 kun\n"
         "/month - joriy oy\n"
         "/3months - oxirgi 3 oy\n"
-        "/export - Excel faylni yuklab olish\n"
-        "/count - mavjud yozuvlar soni va ishlatilayotgan fayl"
+        "/balance - umumiy balans\n"
+        "/export - Excel fayl\n"
+        "/chart - grafik\n"
+        "/limit 5000000 - limit qo'yish\n"
+        "/top - eng katta 3 chiqim"
     )
 
+async def add_entry(update: Update, context: CallbackContext):
+    if update.effective_user.id != OWNER_ID:
+        return
 
-def parse_amount_and_type(text: str):
-    """
-    Qabul qilingan textdan raqam va izohni chiqaradi.
-    Qo'llab-quvvatlanadi: +, - belgilar, ming/ minga / mln / million so'zlari.
-    Agar belgi ko'rsatilmasa => default: chiqim.
-    """
-    orig = text.strip()
-    # ruxsat beramiz: optional sign, then number (digits, spaces, commas, dots), then rest
-    m = re.match(r"^\s*([+-])?\s*([\d\.,\s]+)\s*(.*)$", orig)
-    if not m:
-        return None  # noto'g'ri format
+    text = update.message.text.strip()
+    if text.startswith("+"):
+        try:
+            parts = text.split(" ", 1)
+            amount = int(parts[0].replace("+", ""))
+            note = parts[1] if len(parts) > 1 else "Kirim"
+            add_record(amount, note, "Kirim")
+            await update.message.reply_text(f"✅ {amount:,} so‘m kirim yozildi: {note}")
+        except:
+            await update.message.reply_text("❌ Format xato. Misol: +5000000 oylik tushdi")
 
-    sign, amount_part, rest = m.groups()
-    # tozalash: faqat raqamlarni olish
-    digits = re.sub(r"[^\d]", "", amount_part)
-    if digits == "":
-        return None
+    elif text.startswith("-"):
+        try:
+            parts = text.split(" ", 1)
+            amount = int(parts[0].replace("-", ""))
+            note = parts[1] if len(parts) > 1 else "Chiqim"
+            add_record(-amount, note, "Chiqim")
+            await update.message.reply_text(f"✅ {amount:,} so‘m chiqim yozildi: {note}")
+        except:
+            await update.message.reply_text("❌ Format xato. Misol: -20000 kofe")
 
-    amount = int(digits)
-    rest = rest.strip() if rest else ""
-
-    # multiplier orqali 'ming' yoki 'mln' so'zlarini aniqlaymiz (matnning istalgan joyida)
-    low = orig.lower()
-    multiplier = 1
-    if re.search(r"\b(minga|ming)\b", low):
-        multiplier = 1000
-        # agar rest boshida 'minga' bo'lsa, o'chirish
-        rest = re.sub(r"^\s*(minga|ming)\b\s*", "", rest, flags=re.I)
-    if re.search(r"\b(mln|million|milyon|миллион)\b", low):
-        multiplier = 1_000_000
-
-    amount = amount * multiplier
-
-    if sign == "+":
-        typ = "income"
-    elif sign == "-":
-        typ = "expense"
     else:
-        # agar belgisi ko'rsatilmagan bo'lsa, default — chiqim (siz xohlasangiz bu o'zgartirilishi mumkin)
-        typ = "expense"
+        # avtomatik aniqlash
+        words = text.split(" ")
+        nums = [int("".join(filter(str.isdigit, w))) for w in words if any(ch.isdigit() for ch in w)]
+        if nums:
+            amount = nums[0]
+            note = text
+            if "oldim" in text or "sotib" in text or "chiqdim" in text:
+                add_record(-amount, note, "Chiqim")
+                await update.message.reply_text(f"✅ {amount:,} so‘m chiqim yozildi: {note}")
+            else:
+                add_record(amount, note, "Kirim")
+                await update.message.reply_text(f"✅ {amount:,} so‘m kirim yozildi: {note}")
+        else:
+            await update.message.reply_text("❌ Formatni to‘g‘ri yozing.")
 
-    return amount, rest, typ
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    parsed = parse_amount_and_type(text)
-    if not parsed:
-        await update.message.reply_text("❌ Format noto‘g‘ri. Misol: +5000000 oylik yoki -20000 kofe yoki 8 minga salfetka")
-        return
-
-    amount, desc, typ = parsed
-    add_record(amount, desc, typ)
-    typ_text = "KIRIM" if typ == "income" else "CHIQIM"
-    await update.message.reply_text(f"✅ {amount:,} so‘m {typ_text} yozildi: {desc}")
-
-
-# Summary commands
-async def cmd_3days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    i, e, b, fname = get_summary(days=3)
-    await update.message.reply_text(f"📊 Oxirgi 3 kun\nKirim: {i:,}\nChiqim: {e:,}\nBalans: {b:,}\nFayl: {fname}")
-
-
-async def cmd_7days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    i, e, b, fname = get_summary(days=7)
-    await update.message.reply_text(f"📊 Oxirgi 7 kun\nKirim: {i:,}\nChiqim: {e:,}\nBalans: {b:,}\nFayl: {fname}")
-
-
-async def cmd_10days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    i, e, b, fname = get_summary(days=10)
-    await update.message.reply_text(f"📊 Oxirgi 10 kun\nKirim: {i:,}\nChiqim: {e:,}\nBalans: {b:,}\nFayl: {fname}")
-
-
-async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    i, e, b, fname = get_summary(months=1)
-    await update.message.reply_text(f"📊 Oxirgi 1 oy\nKirim: {i:,}\nChiqim: {e:,}\nBalans: {b:,}\nFayl: {fname}")
-
-
-async def cmd_3months(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    i, e, b, fname = get_summary(months=3)
-    await update.message.reply_text(f"📊 Oxirgi 3 oy\nKirim: {i:,}\nChiqim: {e:,}\nBalans: {b:,}\nFayl: {fname}")
-
-
-# Excel eksport — BytesIO bilan to'g'ri nom bilan yuboradi
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fname = get_file_name()
-    try:
-        df = pd.read_excel(fname)
-    except Exception:
-        await update.message.reply_text("📂 Excel fayl ochilmadi yoki mavjud emas.")
-        return
-
+def filter_data(days=None, months=None):
+    df = load_data()
     if df.empty:
-        await update.message.reply_text("📂 Ma'lumot topilmadi — hali hech narsa yozilmagan.")
+        return pd.DataFrame()
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    if days:
+        since = datetime.now() - timedelta(days=days)
+        return df[df["datetime"] >= since]
+    if months:
+        since = datetime.now() - timedelta(days=30*months)
+        return df[df["datetime"] >= since]
+    return df
+
+async def report(update: Update, context: CallbackContext, df, title):
+    if df.empty:
+        await update.message.reply_text("Ma'lumot yo‘q.")
         return
+    kirim = df[df["type"] == "Kirim"]["amount"].sum()
+    chiqim = df[df["type"] == "Chiqim"]["amount"].sum()
+    balance = kirim + chiqim
+    await update.message.reply_text(
+        f"📊 {title}\n"
+        f"➕ Kirim: {kirim:,}\n"
+        f"➖ Chiqim: {abs(chiqim):,}\n"
+        f"💰 Balans: {balance:,}"
+    )
 
-    output = BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
-    await update.message.reply_document(InputFile(output, filename="hisobot.xlsx"), caption="📊 Sizning hisobot faylingiz")
+async def today(update: Update, context: CallbackContext):
+    df = load_data()
+    if df.empty:
+        await update.message.reply_text("Bugun yozuv yo‘q.")
+        return
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    today_data = df[df["datetime"].dt.date == datetime.now().date()]
+    await report(update, context, today_data, "Bugungi hisob")
 
+async def seven_days(update: Update, context: CallbackContext):
+    df = filter_data(days=7)
+    await report(update, context, df, "Oxirgi 7 kun")
 
-# Diagnostika komandasi
-async def cmd_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fname = get_file_name()
+async def month(update: Update, context: CallbackContext):
+    df = filter_data(months=1)
+    await report(update, context, df, "Joriy oy")
+
+async def three_months(update: Update, context: CallbackContext):
+    df = filter_data(months=3)
+    await report(update, context, df, "Oxirgi 3 oy")
+
+async def balance(update: Update, context: CallbackContext):
+    df = load_data()
+    if df.empty:
+        await update.message.reply_text("Ma'lumot yo‘q.")
+        return
+    kirim = df[df["type"] == "Kirim"]["amount"].sum()
+    chiqim = df[df["type"] == "Chiqim"]["amount"].sum()
+    balance = kirim + chiqim
+    await update.message.reply_text(
+        f"💰 Umumiy balans:\n"
+        f"Kirim: {kirim:,}\n"
+        f"Chiqim: {abs(chiqim):,}\n"
+        f"Balans: {balance:,}"
+    )
+
+async def export(update: Update, context: CallbackContext):
+    df = load_data()
+    if df.empty:
+        await update.message.reply_text("Ma'lumot yo‘q.")
+        return
+    file_name = "hisobot.xlsx"
+    df.to_excel(file_name, index=False)
+    await update.message.reply_document(document=open(file_name, "rb"))
+
+async def chart(update: Update, context: CallbackContext):
+    df = load_data()
+    if df.empty:
+        await update.message.reply_text("Ma'lumot yo‘q.")
+        return
+    # Pie chart by category
+    cat_sum = df.groupby("category")["amount"].sum()
+    plt.figure(figsize=(5,5))
+    cat_sum.plot.pie(autopct='%1.1f%%')
+    plt.ylabel("")
+    plt.title("Kategoriya bo‘yicha chiqim")
+    plt.savefig("chart.png")
+    plt.close()
+    await update.message.reply_photo(photo=open("chart.png", "rb"))
+
+async def set_limit(update: Update, context: CallbackContext):
+    if not context.args:
+        await update.message.reply_text("❌ Limitni kiriting. Masalan: /limit 5000000")
+        return
     try:
-        df = pd.read_excel(fname)
-        n = len(df)
-    except Exception:
-        n = 0
-    await update.message.reply_text(f"Fayl: {fname}\nYozuvlar soni: {n}")
+        limit = int(context.args[0])
+        with open(LIMIT_FILE, "w") as f:
+            f.write(str(limit))
+        await update.message.reply_text(f"✅ Limit {limit:,} so‘m qilib belgilandi.")
+    except:
+        await update.message.reply_text("❌ Limit xato kiritildi.")
 
+async def top_expenses(update: Update, context: CallbackContext):
+    df = load_data()
+    if df.empty:
+        await update.message.reply_text("Ma'lumot yo‘q.")
+        return
+    chiqimlar = df[df["type"] == "Chiqim"].sort_values(by="amount")
+    top3 = chiqimlar.head(3)
+    msg = "🔥 Eng katta 3 chiqim:\n"
+    for i, row in enumerate(top3.itertuples(), 1):
+        msg += f"{i}. {abs(row.amount):,} so‘m – {row.note}\n"
+    await update.message.reply_text(msg)
 
-# Main
+# --- Scheduler ---
+def reminder_job(app: Application):
+    async def send_reminder():
+        await app.bot.send_message(chat_id=OWNER_ID, text="⏰ Bugungi kirim-chiqimlarni yozishni unutmang!")
+    return send_reminder
+
+# --- Main ---
 def main():
-    init_excel()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("3days", cmd_3days))
-    app.add_handler(CommandHandler("7days", cmd_7days))
-    app.add_handler(CommandHandler("10days", cmd_10days))
-    app.add_handler(CommandHandler("month", cmd_month))
-    app.add_handler(CommandHandler("3months", cmd_3months))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("count", cmd_count))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_entry))
 
-    logger.info("Bot ishga tushmoqda...")
+    app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("7days", seven_days))
+    app.add_handler(CommandHandler("month", month))
+    app.add_handler(CommandHandler("3months", three_months))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("export", export))
+    app.add_handler(CommandHandler("chart", chart))
+    app.add_handler(CommandHandler("limit", set_limit))
+    app.add_handler(CommandHandler("top", top_expenses))
+
+    # Scheduler
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(reminder_job(app), "cron", hour=21, minute=0)
+    scheduler.start()
+
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
